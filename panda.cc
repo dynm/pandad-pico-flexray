@@ -416,10 +416,36 @@ static uint8_t calculate_crc8(const uint8_t *p, uint8_t init_value, uint8_t len)
   return crc;
 }
 
+// Pico reports the physical FlexRay receivers as decimal channel combinations
+// (for example 13 = FR1+FR3, 14 = FR1+FR4, and 24 = FR2+FR4). These values are
+// already globally meaningful and must not be shifted by the Panda index.
+static bool is_flexray_source_bus(uint8_t bus) {
+  switch (bus) {
+    case 12:
+    case 13:
+    case 14:
+    case 23:
+    case 24:
+    case 34:
+    case 123:
+    case 124:
+    case 134:
+    case 234:
+      return true;
+    default:
+      return false;
+  }
+}
+
+long Panda::flexray_bus_from_source(uint8_t source) const {
+  return is_flexray_source_bus(source) ? source : source + bus_offset;
+}
+
 void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_data_list,
                                 std::function<void(uint8_t *, size_t)> write_func) {
-  int pos = 0;
+  size_t pos = 0;
   uint8_t send_buf[2 * USB_TX_SOFT_LIMIT];
+  constexpr size_t header_size = 1U + 2U + 1U + 2U;
 
   for (const auto &cmsg : can_data_list) {
     auto dat = cmsg.getDat();
@@ -428,35 +454,32 @@ void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_
     }
 
     uint8_t bus = cmsg.getSrc();
-    if (bus < bus_offset || bus >= (bus_offset + PANDA_BUS_OFFSET)) {
+    // Legacy FlexRay ports use the Panda's 4-bus window. C238 uses Pico's
+    // physical source encoding directly, so accept those explicit IDs too.
+    // The source selects this Pico on the host; injection direction remains a
+    // firmware rule and is intentionally not part of the USB 0x90 record.
+    if (!is_flexray_source_bus(bus) && (bus < bus_offset || bus >= (bus_offset + PANDA_BUS_OFFSET))) {
       continue;
     }
 
     uint16_t frame_id = (uint16_t)(cmsg.getAddress() & 0b11111111111);
     uint8_t base = dat[0];
-    uint32_t payload_bytes = (uint32_t)dat.size();
-    if (payload_bytes > MAX_FRAME_PAYLOAD_BYTES+3) {
+    size_t payload_bytes = dat.size();
+    if (payload_bytes > (MAX_FRAME_PAYLOAD_BYTES + 1U)) {
       continue;
     }
 
-    // Ensure enough space for the fixed header [0x90][u16 id][u8 base][u16 len]
-    const int header_size = 1 + 2 + 1 + 2;
-    if (((int)USB_TX_SOFT_LIMIT - pos) < header_size) {
-      if (pos > 0) {
-        write_func(send_buf, pos);
-        pos = 0;
-      }
+    // A record is atomic: [0x90][u16 id][u8 base][u16 len][CRC][payload].
+    // Flush before it if the complete record would cross the soft limit.
+    const size_t record_size = header_size + payload_bytes;
+    if (record_size > sizeof(send_buf)) {
+      continue;
     }
-
-    // Determine how many payload bytes we can fit without exceeding the soft limit.
-    int available_after_header = (int)USB_TX_SOFT_LIMIT - pos - header_size;
-    if (available_after_header < 0) {
-      // After flush above this should not happen, but guard just in case
+    if (pos > 0 && pos + record_size > USB_TX_SOFT_LIMIT) {
       write_func(send_buf, pos);
       pos = 0;
-      available_after_header = (int)USB_TX_SOFT_LIMIT - header_size;
     }
-    uint16_t len_to_send = (uint16_t)std::min<uint32_t>(payload_bytes, (uint32_t)std::max(0, available_after_header));
+    uint16_t len_to_send = (uint16_t)payload_bytes;
 
     uint8_t crc8 = calculate_crc8(dat.begin() + 1, 0xF1, dat.size() - 1);
 
@@ -464,7 +487,7 @@ void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_
     send_buf[pos++] = 0x90;
     // u16 id (little endian)
     send_buf[pos++] = (uint8_t)(frame_id & 0xFF);
-    send_buf[pos++] = (uint8_t)((frame_id >> 8) & 0xb111);
+    send_buf[pos++] = (uint8_t)((frame_id >> 8) & 0b111);
     // u8 base
     send_buf[pos++] = base;
     // u16 len actually sent (little endian)
@@ -473,13 +496,13 @@ void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_
     // override cycle_count with crc8
     send_buf[pos++] = crc8;
 
-    // Write only the bytes that fit; drop the exceeded part
-    if (len_to_send > 0) {
-      memcpy(&send_buf[pos], dat.begin() + 1, (size_t)len_to_send - 1);
-      pos += len_to_send;
+    // The CRC replaces dat[0] (cycle/base), so append exactly dat[1:].
+    if (len_to_send > 1) {
+      memcpy(&send_buf[pos], dat.begin() + 1, (size_t)len_to_send - 1U);
+      pos += (size_t)len_to_send - 1U;
     }
 
-    if (pos >= (int)USB_TX_SOFT_LIMIT) {
+    if (pos >= USB_TX_SOFT_LIMIT) {
       write_func(send_buf, pos);
       pos = 0;
     }
@@ -557,7 +580,7 @@ bool Panda::unpack_flexray_buffer(uint8_t *data, uint32_t &size, std::vector<can
     if (header_crc_ok && payload_crc_ok) {
       can_frame &canData = out_vec.emplace_back();
       canData.address = frame.frame_id;
-      canData.src = frame.source + bus_offset;
+      canData.src = flexray_bus_from_source(frame.source);
       size_t payload_len = std::min((size_t)expected_payload_bytes, sizeof(frame.payload));
       canData.dat.assign(1, frame.cycle_count);
       canData.dat.append(frame.payload, payload_len);

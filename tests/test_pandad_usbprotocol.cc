@@ -1,6 +1,8 @@
 #define CATCH_CONFIG_MAIN
 #define CATCH_CONFIG_ENABLE_BENCHMARKING
 
+#include <array>
+
 #include "catch2/catch.hpp"
 #include "cereal/messaging/messaging.h"
 #include "common/util.h"
@@ -18,6 +20,33 @@ struct PandaTest : public Panda {
   MessageBuilder msg;
   capnp::List<cereal::CanData>::Reader can_data_list;
 };
+
+struct FlexRayPandaTest : public Panda {
+  explicit FlexRayPandaTest(uint32_t bus_offset) : Panda(bus_offset) {}
+
+  std::vector<std::vector<uint8_t>> pack(const capnp::List<cereal::CanData>::Reader &can_data_list) {
+    std::vector<std::vector<uint8_t>> chunks;
+    pack_flexray_buffer(can_data_list, [&](uint8_t *data, size_t size) {
+      chunks.emplace_back(data, data + size);
+    });
+    return chunks;
+  }
+
+  long map_source(uint8_t source) const {
+    return flexray_bus_from_source(source);
+  }
+};
+
+static uint8_t crc8_1d(const uint8_t *data, size_t len, uint8_t init = 0xF1) {
+  uint8_t crc = init;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc & 0x80U) ? (uint8_t)((crc << 1) ^ 0x1DU) : (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
 
 PandaTest::PandaTest(uint32_t bus_offset_, int can_list_size, cereal::PandaState::PandaType hw_type) : can_list_size(can_list_size), Panda(bus_offset_) {
   this->hw_type = hw_type;
@@ -131,5 +160,107 @@ TEST_CASE("send/recv CAN FD packets") {
   }
   SECTION("chunked_can_receive") {
     test.test_can_recv(0x40);
+  }
+}
+
+TEST_CASE("FlexRay override records are exact and atomic") {
+  FlexRayPandaTest test(4);
+
+  SECTION("19-byte C238 command becomes one exact 25-byte USB record") {
+    MessageBuilder msg;
+    auto can_list = msg.initEvent().initSendcan(1);
+    auto can = can_list[0];
+    const std::array<uint8_t, 19> dat = {
+      0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x32, 0x08, 0x00,
+    };
+    can.setAddress(0x08);
+    can.setSrc(14);
+    can.setDat(kj::arrayPtr(dat.data(), dat.size()));
+
+    auto chunks = test.pack(can_list.asReader());
+    REQUIRE(chunks.size() == 1);
+    REQUIRE(chunks[0].size() == 25);
+    REQUIRE(chunks[0][0] == 0x90);
+    REQUIRE(chunks[0][1] == 0x08);
+    REQUIRE(chunks[0][2] == 0x00);
+    REQUIRE(chunks[0][3] == 0x02);
+    REQUIRE(chunks[0][4] == 19);
+    REQUIRE(chunks[0][5] == 0);
+    REQUIRE(chunks[0][6] == crc8_1d(dat.data() + 1, dat.size() - 1));
+    REQUIRE(chunks[0][6] == 0x92);
+    REQUIRE(memcmp(chunks[0].data() + 7, dat.data() + 1, dat.size() - 1) == 0);
+  }
+
+
+  SECTION("two-channel source IDs are independent of Panda index") {
+    REQUIRE(test.map_source(13) == 13);
+    REQUIRE(test.map_source(14) == 14);
+    REQUIRE(test.map_source(24) == 24);
+
+    // Keep the legacy one-channel mapping for existing FlexRay ports.
+    REQUIRE(test.map_source(1) == 5);
+  }
+
+  SECTION("all explicit two-channel source IDs route to the FlexRay Panda") {
+    MessageBuilder msg;
+    auto can_list = msg.initEvent().initSendcan(3);
+    const std::array<uint8_t, 1> dat = {0x02};
+    const std::array<uint8_t, 3> sources = {13, 14, 24};
+    for (size_t i = 0; i < can_list.size(); ++i) {
+      auto can = can_list[i];
+      can.setAddress((uint16_t)(0x08 + i));
+      can.setSrc(sources[i]);
+      can.setDat(kj::arrayPtr(dat.data(), dat.size()));
+    }
+
+    auto chunks = test.pack(can_list.asReader());
+    REQUIRE(chunks.size() == 1);
+    REQUIRE(chunks[0].size() == 3 * 7);
+  }
+
+  SECTION("records flush before the soft boundary and are never truncated") {
+    MessageBuilder msg;
+    auto can_list = msg.initEvent().initSendcan(11);
+    std::array<uint8_t, 19> dat = {};
+    dat[0] = 0x02;
+    for (size_t i = 0; i < can_list.size(); ++i) {
+      auto can = can_list[i];
+      can.setAddress((uint16_t)(0x08 + i));
+      can.setSrc(5);
+      dat[1] = (uint8_t)i;
+      can.setDat(kj::arrayPtr(dat.data(), dat.size()));
+    }
+
+    auto chunks = test.pack(can_list.asReader());
+    REQUIRE(chunks.size() == 2);
+    REQUIRE(chunks[0].size() == 10 * 25);
+    REQUIRE(chunks[1].size() == 25);
+
+    size_t record_count = 0;
+    for (const auto &chunk : chunks) {
+      for (size_t pos = 0; pos < chunk.size(); pos += 25) {
+        REQUIRE(chunk[pos] == 0x90);
+        REQUIRE(chunk[pos + 4] == 19);
+        REQUIRE(chunk[pos + 5] == 0);
+        ++record_count;
+      }
+    }
+    REQUIRE(record_count == 11);
+  }
+
+  SECTION("the full three high frame-id bits are retained") {
+    MessageBuilder msg;
+    auto can_list = msg.initEvent().initSendcan(1);
+    auto can = can_list[0];
+    const std::array<uint8_t, 1> dat = {0x02};
+    can.setAddress(0x708);
+    can.setSrc(5);
+    can.setDat(kj::arrayPtr(dat.data(), dat.size()));
+
+    auto chunks = test.pack(can_list.asReader());
+    REQUIRE(chunks.size() == 1);
+    REQUIRE(chunks[0][1] == 0x08);
+    REQUIRE(chunks[0][2] == 0x07);
   }
 }
