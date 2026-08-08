@@ -8,6 +8,7 @@
 
 #include "cereal/messaging/messaging.h"
 #include "common/swaglog.h"
+#include "common/timing.h"
 #include "common/util.h"
 
 const bool PANDAD_MAXOUT = getenv("PANDAD_MAXOUT") != nullptr;
@@ -43,6 +44,10 @@ bool Panda::comms_healthy() {
 
 bool Panda::is_flexray() {
   return handle->flexray;
+}
+
+bool Panda::flexray_active(uint64_t timeout_nanos) const {
+  return last_valid_flexray_frame_nanos != 0 && (nanos_since_boot() - last_valid_flexray_frame_nanos) <= timeout_nanos;
 }
 
 std::string Panda::hw_serial() {
@@ -578,6 +583,7 @@ bool Panda::unpack_flexray_buffer(uint8_t *data, uint32_t &size, std::vector<can
     bool payload_crc_ok = (payload_crc == crc_stream);
 
     if (header_crc_ok && payload_crc_ok) {
+      last_valid_flexray_frame_nanos = nanos_since_boot();
       can_frame &canData = out_vec.emplace_back();
       canData.address = frame.frame_id;
       canData.src = flexray_bus_from_source(frame.source);

@@ -250,6 +250,13 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
 
     health_t health = *health_opt;
 
+    // Pico firmware reports ignition high continuously. Derive it from live FlexRay traffic.
+    if (panda->is_flexray()) {
+      const bool active = panda->flexray_active();
+      health.ignition_line_pkt = active;
+      health.ignition_can_pkt = active;
+    }
+
     std::array<can_health_t, PANDA_CAN_CNT> can_health{};
     for (uint32_t i = 0; i < PANDA_CAN_CNT; i++) {
       auto can_health_opt = panda->get_can_state(i);

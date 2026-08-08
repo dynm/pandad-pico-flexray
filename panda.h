@@ -61,6 +61,7 @@ struct flexray_frame_t {
 class Panda {
 private:
   std::unique_ptr<PandaCommsHandle> handle;
+  uint64_t last_valid_flexray_frame_nanos = 0;
 
 public:
   Panda(std::string serial="", uint32_t bus_offset=0);
@@ -72,6 +73,7 @@ public:
   bool comms_healthy();
   std::string hw_serial();
   bool is_flexray();
+  bool flexray_active(uint64_t timeout_nanos = 2000000000ULL) const;
   // Static functions
   static std::vector<std::string> list(bool usb_only=false);
 
