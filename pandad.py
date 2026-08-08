@@ -103,7 +103,6 @@ def main() -> None:
     try:
       count += 1
       cloudlog.event("pandad.flash_and_connect", count=count)
-      params.remove("PandaSignatures")
 
       # Handle missing internal panda
       if no_internal_panda_count > 0:
@@ -150,9 +149,6 @@ def main() -> None:
       pandas.sort(key=lambda x: (not x.is_internal(), x.get_type(), x.get_usb_serial()))
       panda_serials = [p.get_usb_serial() for p in pandas]
 
-      # log panda fw versions
-      params.put("PandaSignatures", b','.join(p.get_signature() for p in pandas))
-
       for panda in pandas:
         if panda.get_usb_serial().startswith(PICO_FLEXRAY_DONGLE_ID_PREFIX):
           cloudlog.warning(f"Panda {panda.get_usb_serial()} is pico-flexray, skipping...")
@@ -170,7 +166,6 @@ def main() -> None:
           params.put_bool("PandaHeartbeatLost", True)
           cloudlog.event("heartbeat lost", deviceState=health, serial=panda.get_usb_serial())
         if health["som_reset_triggered"]:
-          params.put_bool("PandaSomResetTriggered", True)
           cloudlog.event("panda.som_reset_triggered", health=health, serial=panda.get_usb_serial())
 
         if first_run:
