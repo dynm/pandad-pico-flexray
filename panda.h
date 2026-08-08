@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <functional>
@@ -27,6 +28,7 @@
 
 #define PICO_FLEXRAY_DONGLE_ID_PREFIX "picoflex"
 #define MAX_FRAME_PAYLOAD_BYTES 254
+#define FLEXRAY_MAX_RECORD_SIZE (2U + 1U + 5U + MAX_FRAME_PAYLOAD_BYTES + 3U)
 
 struct __attribute__((packed)) can_header {
   uint8_t reserved : 1;
@@ -61,7 +63,7 @@ struct flexray_frame_t {
 class Panda {
 private:
   std::unique_ptr<PandaCommsHandle> handle;
-  uint64_t last_valid_flexray_frame_nanos = 0;
+  std::atomic<uint64_t> last_valid_flexray_frame_nanos = 0;
 
 public:
   Panda(std::string serial="", uint32_t bus_offset=0);
@@ -105,7 +107,7 @@ public:
 
 protected:
   // for unit tests
-  uint8_t receive_buffer[RECV_SIZE + sizeof(can_header) + 64];
+  uint8_t receive_buffer[RECV_SIZE + FLEXRAY_MAX_RECORD_SIZE];
   uint32_t receive_buffer_size = 0;
 
   Panda(uint32_t bus_offset) : bus_offset(bus_offset) {}

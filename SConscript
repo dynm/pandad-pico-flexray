@@ -7,3 +7,4 @@ env.Program('pandad', ['main.cc', 'pandad.cc', 'panda_safety.cc'], LIBS=[panda] 
 
 if GetOption('extras'):
   env.Program('tests/test_pandad_usbprotocol', ['tests/test_pandad_usbprotocol.cc'], LIBS=[panda] + libs)
+  env.Program('tests/test_pandad_health', ['tests/test_pandad_health.cc', 'pandad.cc', 'panda_safety.cc'], LIBS=[panda] + libs)

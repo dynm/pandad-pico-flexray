@@ -12,7 +12,14 @@ struct PandaTest : public Panda {
   PandaTest(uint32_t bus_offset, int can_list_size, cereal::PandaState::PandaType hw_type);
   void test_can_send();
   void test_can_recv(uint32_t chunk_size = 0);
-  void test_chunked_can_recv();
+
+  std::vector<std::vector<uint8_t>> pack_can(const capnp::List<cereal::CanData>::Reader &can_data) {
+    std::vector<std::vector<uint8_t>> chunks;
+    pack_can_buffer(can_data, [&](uint8_t *data, size_t size) {
+      chunks.emplace_back(data, data + size);
+    });
+    return chunks;
+  }
 
   std::map<int, std::string> test_data;
   int can_list_size = 0;
@@ -34,6 +41,24 @@ struct FlexRayPandaTest : public Panda {
 
   long map_source(uint8_t source) const {
     return flexray_bus_from_source(source);
+  }
+
+  std::vector<can_frame> unpack_in_chunks(const std::vector<uint8_t> &data, size_t chunk_size, size_t *remaining_bytes = nullptr) {
+    std::vector<can_frame> frames;
+    receive_buffer_size = 0;
+    size_t pos = 0;
+    while (pos < data.size()) {
+      const size_t size = std::min(chunk_size, data.size() - pos);
+      REQUIRE(receive_buffer_size + size <= sizeof(receive_buffer));
+      memcpy(&receive_buffer[receive_buffer_size], &data[pos], size);
+      receive_buffer_size += size;
+      pos += size;
+      REQUIRE(unpack_flexray_buffer(receive_buffer, receive_buffer_size, frames));
+    }
+    if (remaining_bytes != nullptr) {
+      *remaining_bytes = receive_buffer_size;
+    }
+    return frames;
   }
 };
 
@@ -145,6 +170,9 @@ TEST_CASE("send/recv CAN 2.0 packets") {
   SECTION("chunked_can_receive") {
     test.test_can_recv(0x40);
   }
+  SECTION("single_byte_chunked_can_receive") {
+    test.test_can_recv(1);
+  }
 }
 
 TEST_CASE("send/recv CAN FD packets") {
@@ -161,10 +189,14 @@ TEST_CASE("send/recv CAN FD packets") {
   SECTION("chunked_can_receive") {
     test.test_can_recv(0x40);
   }
+  SECTION("single_byte_chunked_can_receive") {
+    test.test_can_recv(1);
+  }
 }
 
 TEST_CASE("FlexRay override records are exact and atomic") {
   FlexRayPandaTest test(4);
+  STATIC_REQUIRE(FLEXRAY_MAX_RECORD_SIZE == 265U);
 
   SECTION("19-byte C238 command becomes one exact 25-byte USB record") {
     MessageBuilder msg;
@@ -219,7 +251,29 @@ TEST_CASE("FlexRay override records are exact and atomic") {
     REQUIRE(chunks[0].size() == 3 * 7);
   }
 
-  SECTION("records flush before the soft boundary and are never truncated") {
+  SECTION("normal CAN and FlexRay records route to their own Panda") {
+    PandaTest normal_panda(0, 0, cereal::PandaState::PandaType::DOS);
+    MessageBuilder msg;
+    auto can_list = msg.initEvent().initSendcan(2);
+    const std::array<uint8_t, 8> can_dat = {};
+    const std::array<uint8_t, 19> flexray_dat = {};
+
+    can_list[0].setAddress(0x123);
+    can_list[0].setSrc(0);
+    can_list[0].setDat(kj::arrayPtr(can_dat.data(), can_dat.size()));
+    can_list[1].setAddress(0x08);
+    can_list[1].setSrc(14);
+    can_list[1].setDat(kj::arrayPtr(flexray_dat.data(), flexray_dat.size()));
+
+    const auto can_chunks = normal_panda.pack_can(can_list.asReader());
+    const auto flexray_chunks = test.pack(can_list.asReader());
+    REQUIRE(can_chunks.size() == 1);
+    REQUIRE(can_chunks[0].size() == sizeof(can_header) + can_dat.size());
+    REQUIRE(flexray_chunks.size() == 1);
+    REQUIRE(flexray_chunks[0].size() == 25);
+  }
+
+  SECTION("records never cross a 64-byte USB endpoint packet") {
     MessageBuilder msg;
     auto can_list = msg.initEvent().initSendcan(11);
     std::array<uint8_t, 19> dat = {};
@@ -233,12 +287,15 @@ TEST_CASE("FlexRay override records are exact and atomic") {
     }
 
     auto chunks = test.pack(can_list.asReader());
-    REQUIRE(chunks.size() == 2);
-    REQUIRE(chunks[0].size() == 10 * 25);
-    REQUIRE(chunks[1].size() == 25);
+    REQUIRE(chunks.size() == 6);
+    for (size_t i = 0; i < chunks.size() - 1; ++i) {
+      REQUIRE(chunks[i].size() == 2 * 25);
+    }
+    REQUIRE(chunks.back().size() == 25);
 
     size_t record_count = 0;
     for (const auto &chunk : chunks) {
+      REQUIRE(chunk.size() <= USBPACKET_MAX_SIZE);
       for (size_t pos = 0; pos < chunk.size(); pos += 25) {
         REQUIRE(chunk[pos] == 0x90);
         REQUIRE(chunk[pos + 4] == 19);
@@ -247,6 +304,55 @@ TEST_CASE("FlexRay override records are exact and atomic") {
       }
     }
     REQUIRE(record_count == 11);
+  }
+
+  SECTION("a single record must fit in one endpoint packet") {
+    MessageBuilder msg;
+    auto can_list = msg.initEvent().initSendcan(2);
+    const std::array<uint8_t, 58> largest_valid = {};
+    const std::array<uint8_t, 59> too_large = {};
+
+    can_list[0].setAddress(0x08);
+    can_list[0].setSrc(14);
+    can_list[0].setDat(kj::arrayPtr(largest_valid.data(), largest_valid.size()));
+    can_list[1].setAddress(0x08);
+    can_list[1].setSrc(14);
+    can_list[1].setDat(kj::arrayPtr(too_large.data(), too_large.size()));
+
+    auto chunks = test.pack(can_list.asReader());
+    REQUIRE(chunks.size() == 1);
+    REQUIRE(chunks[0].size() == USBPACKET_MAX_SIZE);
+    REQUIRE(chunks[0][4] == largest_valid.size());
+    REQUIRE(chunks[0][5] == 0);
+  }
+
+  SECTION("a maximum-size receive record can arrive one byte at a time") {
+    std::vector<uint8_t> record(FLEXRAY_MAX_RECORD_SIZE, 0);
+    const uint16_t body_len = FLEXRAY_MAX_RECORD_SIZE - 2U;
+    record[0] = (uint8_t)(body_len & 0xFFU);
+    record[1] = (uint8_t)(body_len >> 8);
+    record[2] = 1;     // valid single-channel source
+    record[5] = 0xFE;  // 127 payload words / 254 payload bytes
+
+    size_t remaining_bytes = 0;
+    const auto frames = test.unpack_in_chunks(record, 1, &remaining_bytes);
+    REQUIRE(frames.empty());  // zero CRC bytes intentionally make this invalid
+    REQUIRE(remaining_bytes == 0);
+  }
+
+  SECTION("a valid fragmented receive record updates FlexRay activity") {
+    const std::vector<uint8_t> record = {
+      0x0D, 0x00, 0x0D, 0x00, 0x2B, 0x04, 0x7B, 0x05,
+      0x01, 0x02, 0x03, 0x04, 0x6A, 0x4C, 0x93,
+    };
+
+    REQUIRE_FALSE(test.flexray_active());
+    const auto frames = test.unpack_in_chunks(record, 1);
+    REQUIRE(frames.size() == 1);
+    REQUIRE(frames[0].address == 0x2B);
+    REQUIRE(frames[0].src == 13);
+    REQUIRE(frames[0].dat == std::string("\x05\x01\x02\x03\x04", 5));
+    REQUIRE(test.flexray_active());
   }
 
   SECTION("the full three high frame-id bits are retained") {

@@ -12,6 +12,8 @@
 #include "common/util.h"
 
 const bool PANDAD_MAXOUT = getenv("PANDAD_MAXOUT") != nullptr;
+static_assert(sizeof(health_t) == 61, "pandad requires the current 61-byte Panda health ABI");
+static_assert(sizeof(can_health_t) == 64, "pandad requires the current 64-byte CAN health ABI");
 
 Panda::Panda(std::string serial, uint32_t bus_offset) : bus_offset(bus_offset) {
   // try USB first, then SPI
@@ -47,7 +49,9 @@ bool Panda::is_flexray() {
 }
 
 bool Panda::flexray_active(uint64_t timeout_nanos) const {
-  return last_valid_flexray_frame_nanos != 0 && (nanos_since_boot() - last_valid_flexray_frame_nanos) <= timeout_nanos;
+  const uint64_t last_frame_nanos = last_valid_flexray_frame_nanos.load(std::memory_order_relaxed);
+  const uint64_t now_nanos = nanos_since_boot();
+  return last_frame_nanos != 0 && now_nanos >= last_frame_nanos && (now_nanos - last_frame_nanos) <= timeout_nanos;
 }
 
 std::string Panda::hw_serial() {
@@ -121,13 +125,13 @@ void Panda::set_ir_pwr(uint16_t ir_pwr) {
 std::optional<health_t> Panda::get_state() {
   health_t health {0};
   int err = handle->control_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));
-  return err >= 0 ? std::make_optional(health) : std::nullopt;
+  return err == (int)sizeof(health) ? std::make_optional(health) : std::nullopt;
 }
 
 std::optional<can_health_t> Panda::get_can_state(uint16_t can_number) {
   can_health_t can_health {0};
   int err = handle->control_read(0xc2, can_number, 0, (unsigned char*)&can_health, sizeof(can_health));
-  return err >= 0 ? std::make_optional(can_health) : std::nullopt;
+  return err == (int)sizeof(can_health) ? std::make_optional(can_health) : std::nullopt;
 }
 
 void Panda::set_loopback(bool loopback) {
@@ -257,12 +261,16 @@ bool Panda::can_receive(std::vector<can_frame>& out_vec) {
   // Check if enough space left in buffer to store RECV_SIZE data
   assert(receive_buffer_size + RECV_SIZE <= sizeof(receive_buffer));
 
-  int recv = handle->bulk_read(0x81, &receive_buffer[receive_buffer_size], RECV_SIZE);
+  // A Pico can be connected while the FlexRay bus is silent. Bound the read so
+  // the shared USB lock cannot starve health checks or outgoing overrides.
+  constexpr unsigned int flexray_rx_timeout_ms = 5U;
+  const unsigned int timeout = is_flexray() ? flexray_rx_timeout_ms : TIMEOUT;
+  int recv = handle->bulk_read(0x81, &receive_buffer[receive_buffer_size], RECV_SIZE, timeout);
   if (!comms_healthy()) {
     return false;
   }
 
-  if (PANDAD_MAXOUT) {
+  if (PANDAD_MAXOUT && !is_flexray()) {
     static uint8_t junk[RECV_SIZE];
     handle->bulk_read(0xab, junk, RECV_SIZE - recv);
   }
@@ -284,9 +292,9 @@ void Panda::can_reset_communications() {
 }
 
 bool Panda::unpack_can_buffer(uint8_t *data, uint32_t &size, std::vector<can_frame> &out_vec) {
-  int pos = 0;
+  uint32_t pos = 0;
 
-  while (pos <= size - sizeof(can_header)) {
+  while (pos + sizeof(can_header) <= size) {
     can_header header;
     memcpy(&header, &data[pos], sizeof(can_header));
 
@@ -442,6 +450,10 @@ static bool is_flexray_source_bus(uint8_t bus) {
   }
 }
 
+static bool is_valid_flexray_source(uint8_t source) {
+  return (source >= 1U && source <= 4U) || is_flexray_source_bus(source);
+}
+
 long Panda::flexray_bus_from_source(uint8_t source) const {
   return is_flexray_source_bus(source) ? source : source + bus_offset;
 }
@@ -449,7 +461,7 @@ long Panda::flexray_bus_from_source(uint8_t source) const {
 void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_data_list,
                                 std::function<void(uint8_t *, size_t)> write_func) {
   size_t pos = 0;
-  uint8_t send_buf[2 * USB_TX_SOFT_LIMIT];
+  uint8_t send_buf[USBPACKET_MAX_SIZE];
   constexpr size_t header_size = 1U + 2U + 1U + 2U;
 
   for (const auto &cmsg : can_data_list) {
@@ -475,12 +487,13 @@ void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_
     }
 
     // A record is atomic: [0x90][u16 id][u8 base][u16 len][CRC][payload].
-    // Flush before it if the complete record would cross the soft limit.
+    // Pico's TinyUSB callback receives one 64-byte endpoint packet at a time
+    // and does not reassemble records, so never let a record cross that edge.
     const size_t record_size = header_size + payload_bytes;
     if (record_size > sizeof(send_buf)) {
       continue;
     }
-    if (pos > 0 && pos + record_size > USB_TX_SOFT_LIMIT) {
+    if (pos > 0 && pos + record_size > sizeof(send_buf)) {
       write_func(send_buf, pos);
       pos = 0;
     }
@@ -507,7 +520,7 @@ void Panda::pack_flexray_buffer(const capnp::List<cereal::CanData>::Reader &can_
       pos += (size_t)len_to_send - 1U;
     }
 
-    if (pos >= USB_TX_SOFT_LIMIT) {
+    if (pos == sizeof(send_buf)) {
       write_func(send_buf, pos);
       pos = 0;
     }
@@ -567,9 +580,9 @@ bool Panda::unpack_flexray_buffer(uint8_t *data, uint32_t &size, std::vector<can
     const uint8_t *crc_ptr = &payload_ptr[actual_payload_bytes];
     uint32_t crc_stream = ((uint32_t)crc_ptr[0] << 16) | ((uint32_t)crc_ptr[1] << 8) | (uint32_t)crc_ptr[2];
 
-    if (!length_ok) {
-      // Skip malformed record
-      pos += 1;
+    if (!length_ok || !is_valid_flexray_source(source)) {
+      // The outer record is complete and gives us a trustworthy next boundary.
+      pos += record_len;
       continue;
     }
 
@@ -583,7 +596,7 @@ bool Panda::unpack_flexray_buffer(uint8_t *data, uint32_t &size, std::vector<can
     bool payload_crc_ok = (payload_crc == crc_stream);
 
     if (header_crc_ok && payload_crc_ok) {
-      last_valid_flexray_frame_nanos = nanos_since_boot();
+      last_valid_flexray_frame_nanos.store(nanos_since_boot(), std::memory_order_relaxed);
       can_frame &canData = out_vec.emplace_back();
       canData.address = frame.frame_id;
       canData.src = flexray_bus_from_source(frame.source);

@@ -125,14 +125,7 @@ void can_send_thread(std::vector<Panda *> pandas, bool fake_send) {
 
     // Don't send if older than 1 second
     if ((nanos_since_boot() - event.getLogMonoTime() < 1e9) && !fake_send) {
-      bool any_flexray = std::any_of(pandas.begin(), pandas.end(), [](Panda *p) { return p->is_flexray(); });
-      if (any_flexray) {
-        LOGT("FlexRay panda detected; skipping normal CAN send to non-FlexRay pandas");
-      }
       for (const auto& panda : pandas) {
-        if (any_flexray && !panda->is_flexray()) {
-          continue;
-        }
         LOGT("sending sendcan to panda: %s", (panda->hw_serial()).c_str());
         panda->can_send(event.getSendcan());
         LOGT("sendcan sent to panda: %s", (panda->hw_serial()).c_str());
@@ -253,7 +246,7 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
     // Pico firmware reports ignition high continuously. Derive it from live FlexRay traffic.
     if (panda->is_flexray()) {
       const bool active = panda->flexray_active();
-      health.ignition_line_pkt = active;
+      health.ignition_line_pkt = 0;
       health.ignition_can_pkt = active;
     }
 
@@ -293,7 +286,7 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
     }
 
     bool power_save_desired = !ignition_local;
-    if (health.power_save_enabled_pkt != power_save_desired) {
+    if (!panda->is_flexray() && health.power_save_enabled_pkt != power_save_desired) {
       panda->set_power_saving(power_save_desired);
     }
 
