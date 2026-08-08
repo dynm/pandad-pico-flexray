@@ -324,6 +324,11 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
 }
 
 void send_peripheral_state(Panda *panda, PubMaster *pm) {
+  auto health_opt = panda->get_state();
+  if (!health_opt) {
+    return;
+  }
+
   // build msg
   MessageBuilder msg;
   auto evt = msg.initEvent();
@@ -332,23 +337,9 @@ void send_peripheral_state(Panda *panda, PubMaster *pm) {
   auto ps = evt.initPeripheralState();
   ps.setPandaType(panda->hw_type);
 
-  double read_time = millis_since_boot();
-  ps.setVoltage(Hardware::get_voltage());
-  ps.setCurrent(Hardware::get_current());
-  read_time = millis_since_boot() - read_time;
-  if (read_time > 50) {
-    LOGW("reading hwmon took %lfms", read_time);
-  }
-
-  // fall back to panda's voltage and current measurement
-  if (ps.getVoltage() == 0 && ps.getCurrent() == 0) {
-    auto health_opt = panda->get_state();
-    if (health_opt) {
-      health_t health = *health_opt;
-      ps.setVoltage(health.voltage_pkt);
-      ps.setCurrent(health.current_pkt);
-    }
-  }
+  health_t health = *health_opt;
+  ps.setVoltage(health.voltage_pkt);
+  ps.setCurrent(health.current_pkt);
 
   uint16_t fan_speed_rpm = panda->get_fan_speed();
   ps.setFanSpeedRpm(fan_speed_rpm);
