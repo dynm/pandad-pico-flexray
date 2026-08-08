@@ -14,7 +14,7 @@ from openpilot.common.utils import retry
 from openpilot.common.params import Params
 from openpilot.common.timeout import Timeout
 from openpilot.selfdrive.pandad import can_list_to_can_capnp
-from openpilot.system.hardware import TICI
+from openpilot.common.hardware import TICI
 from openpilot.selfdrive.test.helpers import with_processes
 
 

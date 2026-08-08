@@ -9,7 +9,7 @@ import subprocess
 from panda import Panda, PandaDFU, PandaProtocolMismatch, McuType, FW_PATH
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
-from openpilot.system.hardware import HARDWARE
+from openpilot.common.hardware import HARDWARE, TICI
 from openpilot.common.swaglog import cloudlog
 
 PICO_FLEXRAY_DONGLE_ID_PREFIX = "picoflex"
@@ -137,7 +137,7 @@ def main() -> None:
 
       # Ensure internal panda is present if expected
       internal_pandas = [panda for panda in pandas if panda.is_internal()]
-      if HARDWARE.has_internal_panda() and len(internal_pandas) == 0:
+      if TICI and len(internal_pandas) == 0:
         cloudlog.error("Internal panda is missing, trying again")
         no_internal_panda_count += 1
         continue
@@ -196,7 +196,7 @@ def main() -> None:
 
     # run pandad with all connected serials as arguments
     os.environ['MANAGER_DAEMON'] = 'pandad'
-    process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+    process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
     process.wait()
 
 
